@@ -5,9 +5,12 @@
 import argparse
 import math
 import numpy as np
+import scipy.sparse as sp
 import sys
 import tensorflow as tf
 import time
+from subprocess import check_output
+
 
 class FeedForwardNetwork(object):
     """Constructs a basic multi-layer neural network.
@@ -18,12 +21,12 @@ class FeedForwardNetwork(object):
                 activation=tf.nn.sigmoid):
         with tf.variable_scope("FFN"):
             # Create input/output variables
-            self.x = x = tf.placeholder("float", shape=[None, dim_x])
-            self.y_ = y_ = tf.placeholder("float", shape=[None, dim_y])
+            self.x = x = tf.sparse_placeholder(shape=(None, dim_x), dtype=tf.float32)    # sparse input
+            self.y_ = y_ = tf.placeholder(shape=(None, dim_y), dtype=tf.float32)
 
             # Create model: parameterized for k deep FF layers
             Hsize = [dim_x] + [hidden_units]*layers + [dim_y]
-            print "Layers: %s" % str(Hsize)
+            print("Layers: %s" % str(Hsize))
             k = len(Hsize)-1
             Wall = [None] * k 
             ball = [None] * k
@@ -33,14 +36,15 @@ class FeedForwardNetwork(object):
                 ball[layer] = tf.Variable(tf.constant(0.1,shape=[d2]))
             Hact = [None] * (k+1)
             Hact[0] = x
-            for layer in range(k):
+            Hact[1] = activation(tf.sparse_tensor_dense_matmul(Hact[0], Wall[0]) + ball[0])
+            for layer in range(1, k):
                 Hact[layer+1] = activation(tf.matmul(Hact[layer],Wall[layer]) + ball[layer])
             # output is the last activation
             self.output = y = Hact[k]
 
             # Loss: numerically stable cross-entropy
             self.loss = loss = -tf.reduce_mean(y_*tf.log(y) + 
-                    (tf.sub(1.0,y_)*tf.log(tf.sub(1.000001,y))))
+                    (tf.subtract(1.0,y_)*tf.log(tf.subtract(1.000001,y))))
 
             # Optimizer
             self.lr = tf.Variable(1e-4, trainable=False)
@@ -71,7 +75,7 @@ class DataManager(object):
         """returns a list of k indices into the output vector
         corresponding to the bits for this word
         """
-        if not self.word_assignments.has_key(word):
+        if not word in self.word_assignments:
             idx = len(self.word_assignments)
             self.word_assignments[word] = idx
         return self.word_assignments[word]
@@ -94,18 +98,50 @@ class DataManager(object):
         cust_id = line.split("\t")[0]
         return cust_id
 
+    # def load(self, filename):
+    #     W_list = []
+    #     with open(filename,"r") as f:
+    #         for line in f.readlines():
+    #             words = self.parse_line_into_words(line)
+    #             row = np.zeros((1,self.width))
+    #             for word in words:
+    #                 row = self.set_bit(row,word)
+    #             W_list.append(row)
+        
+    #         self.W = np.concatenate(W_list)
+    #         return self.W
+
+    @staticmethod
+    def get_lines_num(filename):
+        num = 0
+        cmd = "wc -l {}".format(filename)
+        output = check_output(cmd.split())
+        num = int(output.split()[0])
+        return num
+
     def load(self, filename):
-        W_list = []
-        with open(filename,"r") as f:
+        n_users = self.get_lines_num(filename)
+
+        step = int(n_users/100)
+
+        rows = []       # row indices
+        cols = []       # col indices
+        cnt_pairs = 0   # pairs count
+        with open(filename, "r") as f:
+            u = 0
             for line in f.readlines():
                 words = self.parse_line_into_words(line)
-                row = np.zeros((1,self.width))
                 for word in words:
-                    row = self.set_bit(row,word)
-                W_list.append(row)
-        
-            self.W = np.concatenate(W_list)
-            return self.W
+                    rows.append(u)
+                    cols.append(self.index_for_word(word))
+                    cnt_pairs += 1
+                u += 1
+                if u %step == 0:
+                    print(".", end='', flush=True)
+                # if u > 10: break
+        data = np.ones(cnt_pairs, dtype=np.float32)
+        mat = sp.csr_matrix((data, (rows, cols)), shape=(n_users, self.width))
+        return mat
  
 
 class MiniBatcher(object):
@@ -118,6 +154,18 @@ class MiniBatcher(object):
         self.size = x.shape[0]
         if y.shape[0] != self.size:
             raise RuntimeError("X & Y must have same number of entries")
+
+    @staticmethod
+    def csr_to_sparse_tensor(csr):
+        coo = csr.tocoo()
+        return tf.SparseTensorValue(
+            indices=np.array([coo.row, coo.col]).T,
+            values=coo.data,
+            dense_shape=coo.shape)
+
+    @staticmethod
+    def csr_to_tensor(csr):
+        return csr.toarray()
         
     def next(self, n):
         """Generates the next minibatch of n items.
@@ -129,8 +177,8 @@ class MiniBatcher(object):
         b = []
         p1 = self.batch_pos
         p2 = p1 + n
-        b.append( self.x[p1:p2] )
-        b.append( self.y[p1:p2] )
+        b.append( self.csr_to_sparse_tensor(self.x[p1:p2]) )
+        b.append( self.csr_to_tensor(self.y[p1:p2]) )
         self.batch_pos = p2
         return b
  
@@ -169,8 +217,9 @@ def main(cmd):
 
     print("Initializing TensorFlow")
     # train the model
+    init = tf.global_variables_initializer()
     sess = tf.Session()
-    sess.run(tf.initialize_all_variables())
+    sess.run(init)
 
     print("Starting training")
     with sess.as_default():
@@ -185,8 +234,8 @@ def main(cmd):
             dnn.train_step.run(feed_dict=train_dict)
             if i%cmd.eval_iters == 0:
                 spd = (i+1) / (time.time() - start_time)
-                print("Iter %d. %giter/s" % (i,spd))
-        print "Done training\n"
+                print("Iter %d. %giter/s" % (i,spd), flush=True)
+        print("Done training\n")
  
  
 
